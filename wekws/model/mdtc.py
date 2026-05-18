@@ -150,9 +150,9 @@ class TCNStack(nn.Module):
 
     def build_dilations(self):
         dilations = []
-        for s in range(0, self.stack_size):
-            for l in range(0, self.stack_num):
-                dilations.append(2**l)
+        for l in range(0, self.stack_num):
+            for s in range(0, self.stack_size):
+                dilations.append(2**s)
         return dilations
 
     def stack_tcn_blocks(self):
@@ -233,7 +233,7 @@ class MDTC(nn.Module):
         self.padding = self.preprocessor.padding
         for i in range(stack_num):
             self.blocks.append(
-                TCNStack(res_channels, stack_size, 1, res_channels,
+                TCNStack(res_channels, 1, stack_size, res_channels,
                          kernel_size, causal))
             self.padding += self.blocks[-1].padding
         self.half_padding = self.padding // 2
