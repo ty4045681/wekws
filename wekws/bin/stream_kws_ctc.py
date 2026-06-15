@@ -455,7 +455,7 @@ class KeyWordSpotter(torch.nn.Module):
                 logging.info(
                     f"Frame {absolute_time} detect {hit_keyword} "
                     f"from {start} to {end} frame. "
-                    f"but interval {end-self.last_active_pos} "
+                    f"but interval {end - self.last_active_pos} "
                     f"is lower than {self.interval_frames}, Deactivated. ")
 
             elif self.hit_score < self.threshold:

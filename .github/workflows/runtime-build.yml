@@ -1,0 +1,36 @@
+name: Runtime / Build
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "runtime/**"
+      - ".github/workflows/runtime-build.yml"
+  pull_request:
+    paths:
+      - "runtime/**"
+      - ".github/workflows/runtime-build.yml"
+  workflow_dispatch:
+
+env:
+  RUNTIME_DIR: runtime/onnxruntime
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        working-directory: ${{ env.RUNTIME_DIR }}
+        run: cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        working-directory: ${{ env.RUNTIME_DIR }}
+        run: cmake --build build --parallel
