@@ -86,6 +86,8 @@ def get_args():
     parser.add_argument('--num_decoding_left_chunks', type=int, default=-1)
     parser.add_argument('--debug', action='store_true',
                         help='Print per-frame CTC decode debug info')
+    parser.add_argument('--debug_topk', type=int, default=5,
+                        help='Vocab top-k tokens to print per frame with --debug')
     return parser.parse_args()
 
 
@@ -160,6 +162,7 @@ class WeNetKeywordSpotter:
         decoding_chunk_size: int = 16,
         num_decoding_left_chunks: int = -1,
         debug: bool = False,
+        debug_topk: int = 5,
     ):
         if gpu >= 0 and torch.cuda.is_available():
             self.device = torch.device(f'cuda:{gpu}')
@@ -204,6 +207,7 @@ class WeNetKeywordSpotter:
             self.subsampling = int(self.model.subsampling_rate())
 
         blank_id = configs.get('ctc_conf', {}).get('ctc_blank_id', 0)
+        self.blank_id = blank_id
 
         def tokenize_keyword(keyword: str):
             tokens = self.tokenizer.text2tokens(keyword)
@@ -231,6 +235,7 @@ class WeNetKeywordSpotter:
             frame_resolution=self.frame_resolution,
             blank_id=blank_id,
             debug=debug,
+            debug_topk=debug_topk,
             token_repr=self._token_repr,
         )
 
@@ -238,7 +243,6 @@ class WeNetKeywordSpotter:
 
         self.decoding_chunk_size = decoding_chunk_size
         self.num_decoding_left_chunks = num_decoding_left_chunks
-        self.blank_id = blank_id
 
         self.wave_remained = np.array([], dtype=np.float32)
         self.all_feats: Optional[torch.Tensor] = None
@@ -247,6 +251,8 @@ class WeNetKeywordSpotter:
         logging.info('Loaded WeNet checkpoint %s', checkpoint_path)
 
     def _token_repr(self, token_id: int) -> str:
+        if token_id == self.blank_id:
+            return '<blank>'
         if hasattr(self.tokenizer, 'ids2tokens'):
             tokens = self.tokenizer.ids2tokens([token_id])
             if tokens:
@@ -395,6 +401,7 @@ def main():
         decoding_chunk_size=args.decoding_chunk_size,
         num_decoding_left_chunks=args.num_decoding_left_chunks,
         debug=args.debug,
+        debug_topk=args.debug_topk,
     )
 
     fout = open(args.result_file, 'w', encoding='utf-8') if args.result_file \

@@ -126,6 +126,7 @@ class CtcKeywordDecoder:
         frame_resolution: float = 0.01,
         blank_id: int = 0,
         debug: bool = False,
+        debug_topk: int = 5,
         token_repr: Optional[Callable[[int], str]] = None,
     ):
         self.keywords_token = keywords_token
@@ -139,6 +140,7 @@ class CtcKeywordDecoder:
         self.frame_resolution = frame_resolution
         self.blank_id = blank_id
         self.debug = debug
+        self.debug_topk = max(1, debug_topk)
         self.token_repr = token_repr or str
 
         self.cur_hyps = [(tuple(), (1.0, 0.0, []))]
@@ -171,6 +173,14 @@ class CtcKeywordDecoder:
 
     def _format_token(self, token_id: int) -> str:
         return f'{token_id}({self.token_repr(token_id)})'
+
+    def _format_topk_probs(self, prob: torch.Tensor) -> str:
+        k = min(self.debug_topk, prob.numel())
+        top_probs, top_ids = prob.topk(k)
+        parts = []
+        for p, token_id in zip(top_probs.tolist(), top_ids.tolist()):
+            parts.append(f'{self._format_token(token_id)}={p:.4f}')
+        return ', '.join(parts)
 
     def _print_debug_frame(self, frame_idx: int, prob: torch.Tensor,
                            reject_reason: Optional[str]):
@@ -213,6 +223,7 @@ class CtcKeywordDecoder:
         print(
             f'[KWS-DEBUG] frame={frame_idx:05d} '
             f'time={time_sec:.3f}s '
+            f'top{self.debug_topk}=[{self._format_topk_probs(prob)}] '
             f'kw_probs=[{", ".join(kw_probs) or "none"}] '
             f'hyps=[{" | ".join(hyp_parts) or "empty"}] '
             f'{match_info}',
