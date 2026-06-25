@@ -398,6 +398,10 @@ def _run_on_wav_scp(
     detected = 0
     rejected = 0
     interval = int(chunk_seconds * 16000) * 2
+    if result_file:
+        result_dir = os.path.dirname(result_file)
+        if result_dir:
+            os.makedirs(result_dir, exist_ok=True)
     fout = open(result_file, 'w', encoding='utf-8') if result_file else None
 
     with open(wav_scp_path, 'r', encoding='utf-8') as fscp:
