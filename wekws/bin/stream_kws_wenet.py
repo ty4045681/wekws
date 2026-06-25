@@ -84,6 +84,8 @@ def get_args():
     parser.add_argument('--decoding_chunk_size', type=int, default=16,
                         help='WeNet encoder chunk size passed to encoder')
     parser.add_argument('--num_decoding_left_chunks', type=int, default=-1)
+    parser.add_argument('--debug', action='store_true',
+                        help='Print per-frame CTC decode debug info')
     return parser.parse_args()
 
 
@@ -157,6 +159,7 @@ class WeNetKeywordSpotter:
         non_lang_syms: Optional[str] = None,
         decoding_chunk_size: int = 16,
         num_decoding_left_chunks: int = -1,
+        debug: bool = False,
     ):
         if gpu >= 0 and torch.cuda.is_available():
             self.device = torch.device(f'cuda:{gpu}')
@@ -228,7 +231,11 @@ class WeNetKeywordSpotter:
             path_beam=path_beam,
             frame_resolution=self.frame_resolution,
             blank_id=blank_id,
+            debug=debug,
+            token_repr=self._token_repr,
         )
+
+        self.debug = debug
 
         self.decoding_chunk_size = decoding_chunk_size
         self.num_decoding_left_chunks = num_decoding_left_chunks
@@ -239,6 +246,26 @@ class WeNetKeywordSpotter:
         self.processed_encoder_frames = 0
 
         logging.info('Loaded WeNet checkpoint %s', checkpoint_path)
+
+    def _token_repr(self, token_id: int) -> str:
+        if hasattr(self.tokenizer, 'ids2tokens'):
+            tokens = self.tokenizer.ids2tokens([token_id])
+            if tokens:
+                return tokens[0]
+        if hasattr(self.tokenizer, 'detokenize'):
+            return self.tokenizer.detokenize([token_id])
+        return str(token_id)
+
+    def _print_chunk_top1(self, probs: torch.Tensor, start_enc: int):
+        parts = []
+        for local_t, prob in enumerate(probs):
+            enc_t = start_enc + local_t
+            top_prob, top_id = prob.max(dim=0)
+            token_id = int(top_id.item())
+            parts.append(
+                f'enc{enc_t}:{token_id}({self._token_repr(token_id)})'
+                f'={top_prob.item():.4f}')
+        print(f'[KWS-DEBUG] chunk top1: {" | ".join(parts)}', flush=True)
 
     def accept_wave(self, wave: bytes) -> Optional[torch.Tensor]:
         data = []
@@ -300,6 +327,14 @@ class WeNetKeywordSpotter:
             return self.decoder.result
 
         probs = ctc_log_probs[self.processed_encoder_frames:].exp().cpu()
+        if self.debug and probs.size(0) > 0:
+            print(
+                f'[KWS-DEBUG] chunk: +{probs.size(0)} encoder frames '
+                f'(enc {self.processed_encoder_frames}..'
+                f'{self.processed_encoder_frames + probs.size(0) - 1})',
+                flush=True,
+            )
+            self._print_chunk_top1(probs, self.processed_encoder_frames)
         activated = False
         for local_t, prob in enumerate(probs):
             enc_t = self.processed_encoder_frames + local_t
@@ -328,12 +363,13 @@ def _wav_to_pcm_bytes(wav_path: str) -> bytes:
     return (y * (1 << 15)).astype('int16').tobytes()
 
 
-def _run_on_pcm(kws: WeNetKeywordSpotter, wav: bytes, chunk_seconds: float):
+def _run_on_pcm(kws: WeNetKeywordSpotter, wav: bytes, chunk_seconds: float,
+                debug: bool = False):
     interval = int(chunk_seconds * 16000) * 2
     for i in range(0, len(wav), interval):
         chunk = wav[i:min(i + interval, len(wav))]
         result = kws.forward(chunk)
-        if result:
+        if not debug and result.get('state') == 1:
             print(result)
 
 
@@ -359,13 +395,15 @@ def main():
         gpu=args.gpu,
         decoding_chunk_size=args.decoding_chunk_size,
         num_decoding_left_chunks=args.num_decoding_left_chunks,
+        debug=args.debug,
     )
 
     fout = open(args.result_file, 'w', encoding='utf-8') if args.result_file \
         else None
 
     if args.wav_path:
-        _run_on_pcm(kws, _wav_to_pcm_bytes(args.wav_path), args.chunk_seconds)
+        _run_on_pcm(kws, _wav_to_pcm_bytes(args.wav_path), args.chunk_seconds,
+                    debug=args.debug)
 
     if args.wav_scp:
         with open(args.wav_scp, 'r', encoding='utf-8') as fscp:

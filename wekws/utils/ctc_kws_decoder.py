@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import defaultdict
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -125,6 +125,8 @@ class CtcKeywordDecoder:
         path_beam: int = 20,
         frame_resolution: float = 0.01,
         blank_id: int = 0,
+        debug: bool = False,
+        token_repr: Optional[Callable[[int], str]] = None,
     ):
         self.keywords_token = keywords_token
         self.keywords_idxset = keywords_idxset
@@ -136,6 +138,8 @@ class CtcKeywordDecoder:
         self.path_beam = path_beam
         self.frame_resolution = frame_resolution
         self.blank_id = blank_id
+        self.debug = debug
+        self.token_repr = token_repr or str
 
         self.cur_hyps = [(tuple(), (1.0, 0.0, []))]
         self.hit_score = 1.0
@@ -165,12 +169,64 @@ class CtcKeywordDecoder:
         logging.info('Keyword token ids: %s', token_print)
         return keywords_token, keywords_idxset
 
+    def _format_token(self, token_id: int) -> str:
+        return f'{token_id}({self.token_repr(token_id)})'
+
+    def _print_debug_frame(self, frame_idx: int, prob: torch.Tensor,
+                           reject_reason: Optional[str]):
+        time_sec = frame_idx * self.frame_resolution
+        kw_probs = []
+        for token_id in sorted(self.keywords_idxset):
+            p = prob[token_id].item()
+            if p > 1e-6:
+                kw_probs.append(f'{self._format_token(token_id)}={p:.4f}')
+        kw_probs.sort(key=lambda item: float(item.rsplit('=', 1)[1]),
+                      reverse=True)
+
+        hyp_parts = []
+        for rank, (prefix, (pb, pnb, nodes)) in enumerate(
+                self.cur_hyps[:min(3, self.path_beam)]):
+            score = pb + pnb
+            prefix_str = ' '.join(self._format_token(t) for t in prefix)
+            hyp_parts.append(f'#{rank + 1}[{prefix_str}]={score:.4f}')
+
+        match_info = 'match=none'
+        if self.result.get('keyword') is not None or reject_reason:
+            keyword = self.result.get('keyword')
+            if keyword is None and reject_reason:
+                for word, meta in self.keywords_token.items():
+                    lab = meta['token_id']
+                    for prefix, (_, _, nodes) in self.cur_hyps:
+                        if is_sublist(prefix, lab) != -1:
+                            keyword = word
+                            break
+                    if keyword is not None:
+                        break
+            if keyword is not None:
+                status = 'ACTIVATED' if self.activated else 'rejected'
+                detail = (f'match={keyword} score={self.hit_score:.4f} '
+                          f'state={status}')
+                if reject_reason:
+                    detail += f' reason={reject_reason}'
+                match_info = detail
+
+        print(
+            f'[KWS-DEBUG] frame={frame_idx:05d} '
+            f'time={time_sec:.3f}s '
+            f'kw_probs=[{", ".join(kw_probs) or "none"}] '
+            f'hyps=[{" | ".join(hyp_parts) or "empty"}] '
+            f'{match_info}',
+            flush=True,
+        )
+
     def decode_frame(self, frame_idx: int, prob: torch.Tensor):
         next_hyps = ctc_prefix_beam_search(frame_idx, prob, self.cur_hyps,
                                            self.keywords_idxset,
                                            self.score_beam, self.blank_id)
         self.cur_hyps = next_hyps[:self.path_beam]
-        self._execute_detection(frame_idx)
+        reject_reason = self._execute_detection(frame_idx)
+        if self.debug:
+            self._print_debug_frame(frame_idx, prob, reject_reason)
 
         if len(self.cur_hyps) > 0 and len(self.cur_hyps[0][0]) > 0:
             keyword_may_start = int(self.cur_hyps[0][1][2][0]['frame'])
@@ -180,11 +236,12 @@ class CtcKeywordDecoder:
     def finish_chunk(self, num_frames: int):
         self.total_frames += num_frames
 
-    def _execute_detection(self, absolute_time: int):
+    def _execute_detection(self, absolute_time: int) -> Optional[str]:
         hit_keyword = None
         start = 0
         end = 0
         self.hit_score = 1.0
+        reject_reason = None
 
         hyps = [(y[0], y[1][0] + y[1][1], y[1][2]) for y in self.cur_hyps]
         for one_hyp in hyps:
@@ -221,6 +278,19 @@ class CtcKeywordDecoder:
                     absolute_time, hit_keyword, start, end, duration,
                     self.hit_score)
             else:
+                if self.hit_score < self.threshold:
+                    reject_reason = (
+                        f'score {self.hit_score:.4f} < threshold '
+                        f'{self.threshold}')
+                elif not self.min_frames <= duration <= self.max_frames:
+                    reject_reason = (
+                        f'duration {duration} not in '
+                        f'[{self.min_frames}, {self.max_frames}]')
+                else:
+                    reject_reason = (
+                        f'interval too short: end={end} '
+                        f'last_active={self.last_active_pos} '
+                        f'(need >= {self.interval_frames})')
                 logging.debug(
                     'Frame %d detect %s but rejected (score=%.4f, '
                     'duration=%d).', absolute_time, hit_keyword,
@@ -233,6 +303,7 @@ class CtcKeywordDecoder:
             'end': end * self.frame_resolution if self.activated else None,
             'score': self.hit_score if self.activated else None,
         }
+        return reject_reason
 
     def reset(self):
         self.cur_hyps = [(tuple(), (1.0, 0.0, []))]
