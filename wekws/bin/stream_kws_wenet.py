@@ -23,8 +23,10 @@ Example::
     python wekws/bin/stream_kws_wenet.py \\
         --config /path/to/train.yaml \\
         --checkpoint /path/to/step247499.pt \\
-        --dict /path/to/dict \\
-        --keywords "你好小问,嗨小问" \\
+        --symbol_table /path/to/new_10364.txt \\
+        --bpe_model /path/to/unigram5000.model \\
+        --cmvn /path/to/global_cmvn \\
+        --keywords "hey eva" \\
         --wav_path test.wav
 """
 
@@ -34,7 +36,7 @@ import argparse
 import logging
 import os
 import struct
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import librosa
 import numpy as np
@@ -43,8 +45,8 @@ import torchaudio.compliance.kaldi as kaldi
 import yaml
 
 from wekws.utils.ctc_kws_decoder import CtcKeywordDecoder
-from wenet.text.char_tokenizer import CharTokenizer
 from wenet.utils.init_model import init_model
+from wenet.utils.init_tokenizer import init_tokenizer
 
 
 def get_args():
@@ -54,8 +56,16 @@ def get_args():
                         help='WeNet train.yaml used for ASR training')
     parser.add_argument('--checkpoint', required=True,
                         help='WeNet checkpoint, e.g. step247499.pt')
-    parser.add_argument('--dict', required=True,
-                        help='CharTokenizer dict dir or dict.txt path')
+    parser.add_argument('--symbol_table', required=True,
+                        help='Tokenizer symbol table (dict.txt / new_10364.txt)')
+    parser.add_argument('--bpe_model', default=None,
+                        help='BPE model path; required when train.yaml '
+                             'tokenizer is bpe')
+    parser.add_argument('--cmvn', default=None,
+                        help='Global CMVN file; required when train.yaml '
+                             'cmvn is global_cmvn')
+    parser.add_argument('--non_lang_syms', default=None,
+                        help='Optional non-linguistic symbols file')
     parser.add_argument('--wav_path', default=None, help='16k mono wav file')
     parser.add_argument('--wav_scp', default=None, help='Kaldi-style wav.scp')
     parser.add_argument('--result_file', default=None, help='Output result')
@@ -77,16 +87,6 @@ def get_args():
     return parser.parse_args()
 
 
-def _resolve_dict_paths(dict_arg: str) -> Tuple[str, Optional[str]]:
-    if os.path.isdir(dict_arg):
-        dict_txt = os.path.join(dict_arg, 'dict.txt')
-        words_txt = os.path.join(dict_arg, 'words.txt')
-        if not os.path.isfile(words_txt):
-            words_txt = None
-        return dict_txt, words_txt
-    return dict_arg, None
-
-
 def _load_dataset_conf(configs: dict) -> dict:
     dataset_conf = configs['dataset_conf']
     if 'fbank_conf' in dataset_conf:
@@ -97,20 +97,43 @@ def _load_dataset_conf(configs: dict) -> dict:
     return dataset_conf
 
 
-def _prepare_configs(config_path: str, configs: dict) -> dict:
-    config_dir = os.path.dirname(os.path.abspath(config_path))
-    if configs.get('cmvn', None) == 'global_cmvn':
-        cmvn_file = configs['cmvn_conf']['cmvn_file']
-        if not os.path.isabs(cmvn_file):
-            configs['cmvn_conf']['cmvn_file'] = os.path.join(
-                config_dir, cmvn_file)
-    tokenizer_conf = configs.get('tokenizer_conf', {})
-    for key, value in list(tokenizer_conf.items()):
-        if isinstance(value, str) and not os.path.isabs(value):
-            candidate = os.path.join(config_dir, os.path.basename(value))
-            if os.path.exists(candidate):
-                tokenizer_conf[key] = candidate
+def _apply_asset_paths(
+    configs: dict,
+    symbol_table: str,
+    cmvn: Optional[str] = None,
+    bpe_model: Optional[str] = None,
+    non_lang_syms: Optional[str] = None,
+) -> dict:
+    """Override train.yaml asset paths with explicit CLI arguments."""
+    if configs.get('cmvn') == 'global_cmvn':
+        if cmvn is None:
+            raise ValueError(
+                '--cmvn is required when train.yaml uses global_cmvn')
+        configs['cmvn_conf']['cmvn_file'] = cmvn
+
+    tokenizer_conf = configs.setdefault('tokenizer_conf', {})
+    tokenizer_conf['symbol_table_path'] = symbol_table
+
+    tokenizer_type = configs.get('tokenizer', 'char')
+    if tokenizer_type == 'bpe':
+        if bpe_model is None:
+            raise ValueError(
+                '--bpe_model is required when train.yaml tokenizer is bpe')
+        tokenizer_conf['bpe_path'] = bpe_model
+    elif bpe_model is not None:
+        logging.warning('--bpe_model is ignored: tokenizer is %s',
+                        tokenizer_type)
+
+    if non_lang_syms is not None:
+        tokenizer_conf['non_lang_syms_path'] = non_lang_syms
+
     return configs
+
+
+def _check_files_exist(*paths: Optional[str]) -> None:
+    for path in paths:
+        if path is not None and not os.path.isfile(path):
+            raise FileNotFoundError(f'File not found: {path}')
 
 
 class WeNetKeywordSpotter:
@@ -120,7 +143,7 @@ class WeNetKeywordSpotter:
         self,
         config_path: str,
         checkpoint_path: str,
-        dict_path: str,
+        symbol_table: str,
         keywords: str,
         threshold: float,
         min_frames: int,
@@ -129,6 +152,9 @@ class WeNetKeywordSpotter:
         score_beam: int,
         path_beam: int,
         gpu: int,
+        cmvn: Optional[str] = None,
+        bpe_model: Optional[str] = None,
+        non_lang_syms: Optional[str] = None,
         decoding_chunk_size: int = 16,
         num_decoding_left_chunks: int = -1,
     ):
@@ -139,7 +165,15 @@ class WeNetKeywordSpotter:
 
         with open(config_path, 'r', encoding='utf-8') as fin:
             configs = yaml.load(fin, Loader=yaml.FullLoader)
-        configs = _prepare_configs(config_path, configs)
+        configs = _apply_asset_paths(configs, symbol_table, cmvn, bpe_model,
+                                     non_lang_syms)
+        _check_files_exist(
+            checkpoint_path,
+            symbol_table,
+            cmvn,
+            bpe_model,
+            non_lang_syms,
+        )
         self.configs = configs
         self.dataset_conf = _load_dataset_conf(configs)
 
@@ -161,12 +195,7 @@ class WeNetKeywordSpotter:
         self.model = model.to(self.device)
         self.model.eval()
 
-        dict_txt, _ = _resolve_dict_paths(dict_path)
-        non_lang_syms = configs.get('tokenizer_conf', {}).get(
-            'non_lang_syms', None)
-        self.tokenizer = CharTokenizer(dict_txt,
-                                       non_lang_syms,
-                                       split_with_space=True)
+        self.tokenizer = init_tokenizer(configs)
 
         if hasattr(self.model, 'subsampling_rate'):
             self.subsampling = int(self.model.subsampling_rate())
@@ -179,7 +208,11 @@ class WeNetKeywordSpotter:
             ids = self.tokenizer.tokens2ids(tokens)
             if len(ids) == 0:
                 raise ValueError(
-                    f'Keyword "{keyword}" cannot be tokenized with {dict_txt}')
+                    f'Keyword "{keyword}" cannot be tokenized: {tokens}')
+            if any(token_id == blank_id for token_id in ids):
+                raise ValueError(
+                    f'Keyword "{keyword}" contains blank id {blank_id}: '
+                    f'{tokens} -> {ids}')
             return ids
 
         keywords_token, keywords_idxset = CtcKeywordDecoder.build_keywords(
@@ -312,7 +345,10 @@ def main():
     kws = WeNetKeywordSpotter(
         config_path=args.config,
         checkpoint_path=args.checkpoint,
-        dict_path=args.dict,
+        symbol_table=args.symbol_table,
+        cmvn=args.cmvn,
+        bpe_model=args.bpe_model,
+        non_lang_syms=args.non_lang_syms,
         keywords=args.keywords,
         threshold=args.threshold,
         min_frames=args.min_frames,

@@ -149,7 +149,7 @@ class CtcKeywordDecoder:
         keywords: str,
         tokenize_fn,
     ) -> Tuple[Dict[str, Dict[str, Union[Tuple[int, ...], str]]], Set[int]]:
-        keywords_list = keywords.strip().replace(' ', '').split(',')
+        keywords_list = [kw.strip() for kw in keywords.split(',') if kw.strip()]
         keywords_token = {}
         keywords_idxset = {0}
         for keyword in keywords_list:
