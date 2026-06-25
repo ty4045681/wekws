@@ -202,7 +202,6 @@ class WeNetKeywordSpotter:
 
         if hasattr(self.model, 'subsampling_rate'):
             self.subsampling = int(self.model.subsampling_rate())
-            self.frame_resolution = self.frame_shift / 1000.0 * self.subsampling
 
         blank_id = configs.get('ctc_conf', {}).get('ctc_blank_id', 0)
 
