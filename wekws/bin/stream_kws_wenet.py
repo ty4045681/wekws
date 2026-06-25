@@ -378,6 +378,80 @@ def _run_on_pcm(kws: WeNetKeywordSpotter, wav: bytes, chunk_seconds: float,
             print(result)
 
 
+def _update_best_candidate(result: Dict, best_score: float,
+                           best_keyword: Optional[str]):
+    candidate_score = result.get('candidate_score')
+    if candidate_score is None:
+        return best_score, best_keyword
+    if candidate_score > best_score:
+        return candidate_score, result.get('candidate_keyword')
+    return best_score, best_keyword
+
+
+def _run_on_wav_scp(
+    kws: WeNetKeywordSpotter,
+    wav_scp_path: str,
+    chunk_seconds: float,
+    result_file: Optional[str] = None,
+) -> Dict[str, int]:
+    total = 0
+    detected = 0
+    rejected = 0
+    interval = int(chunk_seconds * 16000) * 2
+    fout = open(result_file, 'w', encoding='utf-8') if result_file else None
+
+    with open(wav_scp_path, 'r', encoding='utf-8') as fscp:
+        for line in fscp:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            utt, wav_path = line.split(maxsplit=1)
+            total += 1
+            kws.reset_all()
+            wav = _wav_to_pcm_bytes(wav_path)
+            activated = False
+            hit_score = 0.0
+            hit_keyword = None
+            best_score = 0.0
+            best_keyword = None
+            for i in range(0, len(wav), interval):
+                chunk = wav[i:min(i + interval, len(wav))]
+                result = kws.forward(chunk)
+                best_score, best_keyword = _update_best_candidate(
+                    result, best_score, best_keyword)
+                if result.get('state') == 1:
+                    activated = True
+                    hit_score = result['score']
+                    hit_keyword = result['keyword']
+            if activated:
+                detected += 1
+                if fout:
+                    fout.write('{} detected {} {:.3f}\n'.format(
+                        utt, hit_keyword, hit_score))
+            else:
+                rejected += 1
+                if fout:
+                    if best_keyword is not None:
+                        fout.write('{} rejected best_score={:.4f} ({})\n'.format(
+                            utt, best_score, best_keyword))
+                    else:
+                        fout.write('{} rejected best_score=0.0000\n'.format(
+                            utt))
+
+    recall = (100.0 * detected / total) if total > 0 else 0.0
+    summary = ('total={} detected={} rejected={} recall={:.1f}%'.format(
+        total, detected, rejected, recall))
+    print('[KWS-BATCH] {}'.format(summary), flush=True)
+    if fout:
+        fout.write('# {}\n'.format(summary))
+        fout.close()
+    return {
+        'total': total,
+        'detected': detected,
+        'rejected': rejected,
+    }
+
+
 def main():
     args = get_args()
     logging.basicConfig(level=logging.INFO,
@@ -404,34 +478,13 @@ def main():
         debug_topk=args.debug_topk,
     )
 
-    fout = open(args.result_file, 'w', encoding='utf-8') if args.result_file \
-        else None
-
     if args.wav_path:
         _run_on_pcm(kws, _wav_to_pcm_bytes(args.wav_path), args.chunk_seconds,
                     debug=args.debug)
 
     if args.wav_scp:
-        with open(args.wav_scp, 'r', encoding='utf-8') as fscp:
-            for line in fscp:
-                utt, wav_path = line.strip().split(maxsplit=1)
-                kws.reset_all()
-                wav = _wav_to_pcm_bytes(wav_path)
-                activated = False
-                interval = int(args.chunk_seconds * 16000) * 2
-                for i in range(0, len(wav), interval):
-                    chunk = wav[i:min(i + interval, len(wav))]
-                    result = kws.forward(chunk)
-                    if result.get('state') == 1:
-                        activated = True
-                        if fout:
-                            fout.write('{} detected {} {:.3f}\n'.format(
-                                utt, result['keyword'], result['score']))
-                if not activated and fout:
-                    fout.write('{} rejected\n'.format(utt))
-
-    if fout:
-        fout.close()
+        _run_on_wav_scp(kws, args.wav_scp, args.chunk_seconds,
+                        result_file=args.result_file)
 
 
 if __name__ == '__main__':

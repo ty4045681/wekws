@@ -313,6 +313,9 @@ class CtcKeywordDecoder:
             'start': start * self.frame_resolution if self.activated else None,
             'end': end * self.frame_resolution if self.activated else None,
             'score': self.hit_score if self.activated else None,
+            'candidate_keyword': hit_keyword,
+            'candidate_score': (self.hit_score if hit_keyword is not None
+                                else None),
         }
         return reject_reason
 
